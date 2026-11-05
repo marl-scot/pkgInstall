@@ -1,0 +1,4 @@
+# pkgInstall: see README.md
+name = pkgInstall
+language = shell
+release = none

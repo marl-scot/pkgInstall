@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# MIT License - Copyright (c) 2026 Marl Scot
+#
+# pkg-install: install packages with the system's native package manager,
+# translating package names that differ between managers.
+#
+# Usage: pkg-install [options] PACKAGE...
+#   -y, --yes            install without asking
+#   -n, --dry-run        print the install commands instead of running them
+#   -c, --check          only check: exit 0 if all are installed, 1 if not
+#   -m, --manager NAME   use NAME instead of detecting the package manager
+#       --print-manager  print the detected package manager and exit
+#       --print-name     print each package's name for the manager and exit
+#   -h, --help           show this help
+#   -V, --version        show the version
+#
+# Managers: apt, dnf, yum, zypper, pacman, apk, brew.
+# PACKAGE is a generic name, translated per manager by the built-in table
+# and then the user map ($PKG_INSTALL_MAP, default
+# ~/.config/pkg-install/packages.map), whose lines win. Map lines look like:
+#   dig  apt=dnsutils dnf=bind-utils brew=bind     (name "-": not available)
+#
+# Self-contained, so it also works piped over ssh to a host without it:
+#   ssh -t HOST 'bash -s -- tmux' < pkg-install      (-t so it can prompt)
+#   ssh HOST 'bash -s -- --yes tmux' < pkg-install   (no terminal: --yes)
+#
+# Exit status: 0 done (or all installed), 1 missing (--check) or declined,
+# 2 usage error, 3 no supported package manager, 4 install failed or a
+# package isn't available for this manager.
+
+VERSION=0.1.0
+MANAGERS=(apt dnf yum zypper pacman apk brew)
+
+usage() {   # print the header comment as help
+    local line
+    while IFS= read -r line; do
+        [[ $line == '#!'* || $line == '# MIT'* ]] && continue
+        [[ $line == '#'* ]] || break
+        line=${line#\#}; printf '%s\n' "${line# }"
+    done <"${BASH_SOURCE[0]}" 2>/dev/null || echo "usage: pkg-install [options] PACKAGE..."
+}
+
+die() {   # die STATUS MESSAGE
+    echo "pkg-install: $2" >&2
+    exit "$1"
+}
+
+# Package-name table, generic name first, then manager=name overrides.
+# A name of "-" means the package isn't available for that manager.
+# Anything not listed uses the generic name unchanged.
+builtin_map() {
+    cat <<'MAP'
+dig         apt=dnsutils dnf=bind-utils yum=bind-utils zypper=bind-utils pacman=bind apk=bind-tools brew=bind
+fd          apt=fd-find
+nc          apt=netcat-openbsd dnf=nmap-ncat yum=nmap-ncat zypper=netcat-openbsd pacman=openbsd-netcat apk=netcat-openbsd brew=netcat
+pip         apt=python3-pip dnf=python3-pip yum=python3-pip zypper=python3-pip pacman=python-pip apk=py3-pip brew=-
+python3     pacman=python brew=python
+vim         dnf=vim-enhanced yum=vim-enhanced
+MAP
+}
+
+# User map: same format, read after the built-in table so its entries win.
+user_map_file() {
+    printf '%s\n' "${PKG_INSTALL_MAP:-${XDG_CONFIG_HOME:-$HOME/.config}/pkg-install/packages.map}"
+}
+
+# detect_manager: print the first supported package manager found.
+# On macOS brew is the only candidate; elsewhere brew comes last, so a
+# Linuxbrew install doesn't take over from the system manager.
+detect_manager() {
+    local candidates=("${MANAGERS[@]}") manager
+    [[ ${OSTYPE-} == darwin* ]] && candidates=(brew)
+    for manager in "${candidates[@]}"; do
+        if command -v "$(manager_command "$manager")" >/dev/null 2>&1; then
+            printf '%s\n' "$manager"
+            return 0
+        fi
+    done
+    return 1
+}
+
+manager_command() {   # the executable that identifies a manager
+    case $1 in
+        apt) echo apt-get ;;
+        *)   echo "$1" ;;
+    esac
+}
+
+# native_name MANAGER PACKAGE: print the manager's name for PACKAGE.
+native_name() {
+    local manager=$1 package=$2 name=$2 generic field
+    local map_file; map_file=$(user_map_file)
+    {
+        builtin_map
+        [[ -r $map_file ]] && cat "$map_file"
+    } | {
+        while read -r generic rest; do
+            [[ -z $generic || $generic == '#'* || $generic != "$package" ]] && continue
+            for field in $rest; do
+                [[ $field == "$manager="* ]] && name=${field#*=}
+            done
+        done
+        printf '%s\n' "$name"
+    }
+}
+
+# is_installed MANAGER NATIVE_NAME: succeed if the package is installed.
+is_installed() {
+    local status
+    case $1 in
+        apt)
+            status=$(dpkg-query -W -f='${Status}' "$2" 2>/dev/null) || return 1
+            [[ $status == *" installed" ]] ;;
+        dnf|yum|zypper) rpm -q "$2" >/dev/null 2>&1 ;;
+        pacman) pacman -Q "$2" >/dev/null 2>&1 ;;
+        apk)    apk info -e "$2" >/dev/null 2>&1 ;;
+        brew)   [[ -n $(brew list --versions "$2" 2>/dev/null) ]] ;;
+    esac
+}
+
+# install_commands MANAGER NAME...: print one install command per line.
+install_commands() {
+    local manager=$1; shift
+    case $manager in
+        apt)    echo "apt-get update -qq"
+                echo "env DEBIAN_FRONTEND=noninteractive apt-get install -y $*" ;;
+        dnf)    echo "dnf install -y $*" ;;
+        yum)    echo "yum install -y $*" ;;
+        zypper) echo "zypper --non-interactive install $*" ;;
+        pacman) echo "pacman -S --needed --noconfirm $*" ;;
+        apk)    echo "apk add $*" ;;
+        brew)   echo "brew install $*" ;;
+    esac
+}
+
+# confirm QUESTION: ask on the terminal. Reads /dev/tty rather than stdin,
+# because piped over ssh stdin is this script. No terminal means no.
+confirm() {
+    local answer
+    { : </dev/tty; } 2>/dev/null || return 2
+    printf '%s [y/N] ' "$1" >/dev/tty
+    read -r answer </dev/tty || return 1
+    [[ $answer == [yY]* ]]
+}
+
+main() {
+    local yes=0 dry_run=0 check=0 manager='' print_manager=0 print_name=0
+    local packages=()
+    while (( $# )); do
+        case $1 in
+            -y|--yes)        yes=1 ;;
+            -n|--dry-run)    dry_run=1 ;;
+            -c|--check)      check=1 ;;
+            -m|--manager)    [[ -n ${2-} ]] || die 2 "$1 needs a name"; manager=$2; shift ;;
+            --print-manager) print_manager=1 ;;
+            --print-name)    print_name=1 ;;
+            -h|--help)       usage; exit 0 ;;
+            -V|--version)    echo "pkg-install $VERSION"; exit 0 ;;
+            --)              shift; packages+=("$@"); break ;;
+            -*)              die 2 "unknown option: $1 (see --help)" ;;
+            *)               packages+=("$1") ;;
+        esac
+        shift
+    done
+
+    if [[ -n $manager ]]; then
+        [[ " ${MANAGERS[*]} " == *" $manager "* ]] ||
+            die 2 "unsupported manager: $manager (one of: ${MANAGERS[*]})"
+    else
+        manager=$(detect_manager) ||
+            die 3 "no supported package manager found (looked for: ${MANAGERS[*]})"
+    fi
+    if (( print_manager )); then
+        echo "$manager"
+        exit 0
+    fi
+    (( ${#packages[@]} )) || die 2 "no package given (see --help)"
+
+    local package name missing=() unavailable=()
+    for package in "${packages[@]}"; do
+        name=$(native_name "$manager" "$package")
+        if (( print_name )); then
+            echo "$name"
+        elif [[ $name == - ]]; then
+            unavailable+=("$package")
+        elif ! is_installed "$manager" "$name"; then
+            missing+=("$name")
+        fi
+    done
+    (( print_name )) && exit 0
+    (( ${#unavailable[@]} )) && die 4 "not available via $manager: ${unavailable[*]}"
+    if (( ! ${#missing[@]} )); then
+        (( check )) || echo "already installed: ${packages[*]}"
+        exit 0
+    fi
+    if (( check )); then
+        echo "not installed: ${missing[*]}"
+        exit 1
+    fi
+
+    # brew refuses to run as root; everything else needs root.
+    local sudo=''
+    if [[ $manager != brew && $EUID -ne 0 ]]; then
+        command -v sudo >/dev/null 2>&1 || (( dry_run )) ||
+            die 4 "installing needs root, and sudo isn't available"
+        sudo='sudo '
+    fi
+    local commands; commands=$(install_commands "$manager" "${missing[@]}")
+    if (( dry_run )); then
+        sed "s/^/$sudo/" <<<"$commands"
+        exit 0
+    fi
+    if (( ! yes )); then
+        confirm "Install ${missing[*]} with $manager?"
+        case $? in
+            0) ;;
+            2) die 1 "not installed: ${missing[*]} (no terminal to ask; re-run with --yes)" ;;
+            *) die 1 "not installed: ${missing[*]} (declined)" ;;
+        esac
+    fi
+    local command
+    while IFS= read -r command; do
+        echo "+ $sudo$command" >&2
+        # shellcheck disable=SC2086  # the command is built from known words
+        $sudo $command || die 4 "failed: $sudo$command"
+    done <<<"$commands"
+    for name in "${missing[@]}"; do
+        is_installed "$manager" "$name" || die 4 "$name still not installed after $manager ran"
+    done
+    echo "installed: ${missing[*]}"
+}
+
+main "$@"
